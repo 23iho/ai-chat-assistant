@@ -24,7 +24,7 @@ def call_ai(message:str,history:list=None)->str:
         messages.append({"role":"user","content":message})
         #调用Qwen AI接口
         response=Generation.call(
-            model="qwen2.5-3b-instruct",
+            model=os.getenv("QWEN_MODEL"),
             messages=messages,
             temperature=0.5,
             max_tokens=2048,
