@@ -1,9 +1,17 @@
-from fastapi import FastAPI
+from fastapi import FastAPI,HTTPException
+from fastapi.responses import JSONResponse
 from ai_service import call_ai
 from pydantic import BaseModel,Field
 
 #创建FastAPI实例
 app = FastAPI(title="AI聊天助手",version="0.1.0")
+#全局异常捕获
+@app.exception_handler(Exception)
+async def global_exception_handler(request,exc):
+    return JSONResponse(
+        status_code=200,
+        content={"code":400,"message":f"服务器异常：{str(exc)}","data":None}
+    )
 
 #定义请求体模型
 class ChatRequest(BaseModel):
@@ -21,13 +29,13 @@ def health_check():
 #@app.get("/chat")：接口路径是/chat.访问http://127.0.0.1:8000/chat就会到这里
 #tags=["聊天接口"]：分类到聊天接口
 @app.get("/chat",tags=["聊天接口"])
-def chat_get(message:str):
+def chat_get(message:str,clear_history:bool=False):
     """
     get方式调用AI聊天
     ：param message：用户输入的消息（通过url参数传入）
     ：return：统一相应格式
     """
-    answer=call_ai(message)
+    answer=call_ai(message,clear_history)
     return {
         "code":200,
         "message":"success",
@@ -46,7 +54,7 @@ def chat_post(req:ChatRequest):
     """
     #1.从请求体中去除用户的消息（req.message)
     #2.调用call_ai函数
-    answer=call_ai(req.message)
+    answer=call_ai(req.message,clear_history=req.clear_history)
     return {
         "code":200,
         "message":"success",
@@ -56,4 +64,4 @@ def chat_post(req:ChatRequest):
 #主程序入口
 if __name__=="__main__":
     import uvicorn
-    uvicorn.run("main:app",host="0.0.0.0",port=8000,reload=True)
+    uvicorn.run("main:app",host="127.0.0.1",port=8000,reload=True)
