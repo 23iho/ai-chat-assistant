@@ -23,7 +23,12 @@ class ChatRequest(BaseModel):
 #健康检查接口：用来判断服务是否正常运行
 @app.get("/",tags=["系统接口"])
 def health_check():
-    return {"status":"ok","message":"AI聊天助手服务已启动"}
+    return {
+        "code":200,
+        "message":"success",
+        "data":{"status":"ok","message":"AI聊天助手服务已启动"}
+        }
+
 
 #定义get方式聊天接口
 #@app.get("/chat")：接口路径是/chat.访问http://127.0.0.1:8000/chat就会到这里
