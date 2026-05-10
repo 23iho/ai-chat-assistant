@@ -1,8 +1,7 @@
 from sqlalchemy import create_engine,Column,Integer,String,Text,DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
-
+from passlib.context import CryptContext
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -22,6 +21,37 @@ engine = create_engine(
 Base = declarative_base()
 #创建会话工厂
 SessionLocal = sessionmaker(autocommit=False,autoflush=False,bind=engine)
+
+#创建密码加密上下文
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+class User(Base):
+    __tablename__ = "users"  #指定表名
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(50),unique=True,nullable=False,index=True)
+    password_hash = Column(String(255),nullable=False)
+    email = Column(String(100),unique=True,nullable=True)
+    create_time = Column(DateTime,default=datetime.now)
+
+#密码加密与验证
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+#用户查询与注册
+def get_user_by_username(db,username: str):
+    return db.query(User).filter(User.username == username).first()
+def create_user(db,username:str,password:str,email:str = None):
+    hashed_password  = get_password_hash(password)
+    db_user = User(
+        username=username,
+        password_hash=hashed_password,
+        email=email
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
 
 #聊天记录表模型
 class ChatRecord(Base):
@@ -89,5 +119,6 @@ def delete_chat_history(db,user_id:str):
 
 if __name__ == "__main__":
     db=next(get_db())
-    count=delete_chat_history(db,"default_user")
-    print(f"已删除{count}条记录")
+    text_user = create_user(db,"test_user","123456")
+    print(f"创建用户：{text_user.username}，ID：{text_user.id}")
+    print(f"验证密码（正确）：{verify_password('123456',text_user.password_hash)}")

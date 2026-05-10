@@ -22,7 +22,7 @@ def call_ai(message:str,clear_history:bool = False):
     """
     #先检查是否需要清空上下文
     if clear_history:
-        chat_history=[]
+        chat_history={}
     try:
         #拼接上下文
         chat_history.append({"role":"user","content":message})
