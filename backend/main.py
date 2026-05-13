@@ -1,7 +1,8 @@
 from fastapi import FastAPI,HTTPException,Depends,status,Form
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from ai_service import call_ai,chat_history
+from ai_service import call_ai
 from pydantic import BaseModel,Field,EmailStr,StringConstraints
 from typing import Annotated
 from sqlalchemy.orm import Session
@@ -20,6 +21,14 @@ app = FastAPI(
     version="0.1.0",
 )
 
+# 配置CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 开发环境允许所有来源
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 #定义请求体模型
 class ChatRequest(BaseModel):
@@ -73,6 +82,13 @@ def chat_get(
     current_user = Depends(get_current_user)
 ):
     user_id = current_user.id
+    # 如果内存上下文为空，从数据库加载最近记录重建上下文
+    if user_id not in user_chat_history or not user_chat_history[user_id]:
+        records = get_chat_history(db, user_id, limit=20)
+        user_chat_history[user_id] = [
+            {"role": r.role, "content": r.content}
+            for r in records
+        ]
     user_history = get_user_history(user_id)
     if clear_history:
         clear_user_history(user_id)
@@ -103,6 +119,13 @@ def chat_post(
     current_user = Depends(get_current_user) 
 ):
     user_id = current_user.id
+    # 如果内存上下文为空，从数据库加载最近记录重建上下文
+    if user_id not in user_chat_history or not user_chat_history[user_id]:
+        records = get_chat_history(db, user_id, limit=20)
+        user_chat_history[user_id] = [
+            {"role": r.role, "content": r.content}
+            for r in records
+        ]
     user_history = get_user_history(user_id)
     if req.clear_history:
         clear_user_history(user_id)

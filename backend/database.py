@@ -58,7 +58,7 @@ class ChatRecord(Base):
     __tablename__ = "chat_records"  #指定表名
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String(50),nullable=False)
+    user_id = Column(Integer, nullable=False)
     role = Column(String(20),nullable=False)  # "user" 或 "assistant"
     content = Column(Text,nullable=False)
     create_time = Column(DateTime,default=datetime.now)
@@ -74,10 +74,11 @@ def get_db():
     finally:
         db.close()
 
-def save_and_record(db,user_id:str,role:str,content:str):
+def save_and_record(db, user_id: int, role: str, content: str):
     """
     保存单条聊天记录到数据库
     param db：数据库会话
+    param user_id: 用户ID
     param role:角色（user或assistant）
     param content:聊天内容
     return: 保存的记录对象
@@ -88,7 +89,7 @@ def save_and_record(db,user_id:str,role:str,content:str):
     db.refresh(db_record)
     return db_record
 
-def get_chat_history(db,user_id:str,skip:int=0,limit:int=100):
+def get_chat_history(db, user_id: int, skip: int = 0, limit: int = 100):
     """
     获取用户聊天记录
     param db：数据库会话
@@ -104,7 +105,7 @@ def get_chat_history(db,user_id:str,skip:int=0,limit:int=100):
         .limit(limit)\
         .all()
 
-def delete_chat_history(db,user_id:str):
+def delete_chat_history(db, user_id: int):
     """
     删除指定用户聊天记录
     param db：数据库会话
