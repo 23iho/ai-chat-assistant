@@ -403,11 +403,27 @@ async function loadHistoryList() {
             reversedHistory.forEach(record => {
                 const item = document.createElement('div');
                 item.className = 'history-item';
-                item.innerHTML = `
-                    <div class="role">${record.role === 'user' ? '👤 我' : '🤖 AI'}</div>
-                    <div class="content">${record.content}</div>
-                    <div class="time">${record.create_time}</div>
-                `;
+
+                // 之前用 innerHTML 拼 record.content 是存储型 XSS：
+                // 用户发一条 <img src=x onerror=alert(1)> 就会被持久化，
+                // 下次任何人打开侧边栏都会触发（主聊天区用 textContent 是安全的）。
+                // 改成 createElement + textContent，浏览器自动转义。
+                const roleEl = document.createElement('div');
+                roleEl.className = 'role';
+                roleEl.textContent = record.role === 'user' ? '👤 我' : '🤖 AI';
+
+                const contentEl = document.createElement('div');
+                contentEl.className = 'content';
+                contentEl.textContent = record.content;
+                contentEl.title = record.content;  // 鼠标悬停看完整内容
+
+                const timeEl = document.createElement('div');
+                timeEl.className = 'time';
+                timeEl.textContent = record.create_time;
+
+                item.appendChild(roleEl);
+                item.appendChild(contentEl);
+                item.appendChild(timeEl);
                 historyList.appendChild(item);
             });
         }
