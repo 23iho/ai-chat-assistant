@@ -24,7 +24,7 @@ app = FastAPI(
 # 配置CORS中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发环境允许所有来源
+    allow_origins=["http://localhost:8080"], 
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -263,4 +263,4 @@ def get_my_info(current_user=Depends(get_current_user)):
 #主程序入口
 if __name__=="__main__":
     import uvicorn
-    uvicorn.run("main:app",host="127.0.0.1",port=8000,reload=True)
+    uvicorn.run("main:app",host="0.0.0.0",port=8000,reload=True)
