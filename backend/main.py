@@ -46,14 +46,86 @@ class UserLogin(BaseModel):
 
 
 
-user_chat_history = {}
-# 获取当前用户的上下文
-def get_user_history(user_id: int):
-    if user_id not in user_chat_history:
-        user_chat_history[user_id] = []
-    return user_chat_history[user_id]
-def clear_user_history(user_id: int):
-    user_chat_history[user_id] = []
+class UserContextCache:
+    """进程内用户上下文缓存（最近 N 轮对话）。
+
+    ⚠️ 已知限制（写进 README "Known Issues"）：
+    - 单进程内存，重启即丢，下次访问从 DB 回填
+    - 多 worker 部署下命中率会下降（每个 worker 各自一份内存）
+    - 仅适合开发/单机，生产环境请替换为 Redis Hash + TTL
+
+    这里先做一个简单的有界实现，防止长期运行内存无限增长。
+    """
+
+    # 单 worker 最多保留多少用户的活跃上下文；超出会按 LRU 淘汰最久未访问的。
+    # 设为 0 表示不淘汰（仅用于 debug）。
+    MAX_USERS = 1000
+
+    def __init__(self, max_window: int = 20):
+        self._store: dict[int, list] = {}
+        self._access_order: list[int] = []  # 头部最久未访问，尾部最新
+        self.max_window = max_window
+
+    def get(self, user_id: int) -> list:
+        """获取用户上下文窗口，未命中时初始化为空列表。"""
+        if user_id not in self._store:
+            self._evict_if_needed()
+            self._store[user_id] = []
+        self._touch(user_id)
+        return self._store[user_id]
+
+    def clear(self, user_id: int) -> None:
+        """清空指定用户的上下文窗口。"""
+        self._store[user_id] = []
+        self._touch(user_id)
+
+    def append_message(self, user_id: int, role: str, content: str) -> None:
+        """追加一条消息并按窗口长度截断。"""
+        window = self.get(user_id)
+        window.append({"role": role, "content": content})
+        if len(window) > self.max_window:
+            # 只保留最后 max_window 条
+            self._store[user_id] = window[-self.max_window:]
+        self._touch(user_id)
+
+    def evict(self, user_id: int) -> None:
+        """主动移除某个用户（用于账号注销等场景）。"""
+        self._store.pop(user_id, None)
+        if user_id in self._access_order:
+            self._access_order.remove(user_id)
+
+    def stats(self) -> dict:
+        """便于调试 / 监控。"""
+        return {
+            "active_users": len(self._store),
+            "max_users": self.MAX_USERS,
+            "max_window": self.max_window,
+        }
+
+    def _touch(self, user_id: int) -> None:
+        if user_id in self._access_order:
+            self._access_order.remove(user_id)
+        self._access_order.append(user_id)
+
+    def _evict_if_needed(self) -> None:
+        if self.MAX_USERS <= 0:
+            return
+        while len(self._store) >= self.MAX_USERS and self._access_order:
+            oldest = self._access_order.pop(0)
+            self._store.pop(oldest, None)
+
+
+# 全局实例（开发/单机用），生产环境替换为 Redis 实现
+user_chat_history = UserContextCache(max_window=20)
+
+
+# 兼容旧调用：让 main.py 里的 get_user_history / clear_user_history 仍然可用
+def get_user_history(user_id: int) -> list:
+    return user_chat_history.get(user_id)
+
+
+def clear_user_history(user_id: int) -> None:
+    user_chat_history.clear(user_id)
 
 #全局异常捕获
 @app.exception_handler(Exception)
