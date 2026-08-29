@@ -208,28 +208,23 @@ def user_register(req:UserRegister,db:Session=Depends(get_db)):
 #定义登录接口
 @app.post("/login",tags=["用户系统"])
 def user_login(req:UserLogin,db:Session=Depends(get_db)):
-    try:
-        user = get_user_by_username(db,req.username)
-        if not user:
-            raise HTTPException(status_code=401,detail="用户名或密码错误")
+    # 注意：这里不再套 try/except。HTTPException 是 Exception 的子类，
+    # 之前的 except Exception 写在前，会先把 HTTPException 吞掉变成 400，
+    # 后面的 except HTTPException 是永远不可达的死代码。
+    # 业务异常由 FastAPI 内置 handler 渲染成 JSONResponse，符合 REST 语义。
+    user = get_user_by_username(db,req.username)
+    if not user:
+        raise HTTPException(status_code=401,detail="用户名或密码错误")
 
-        if not verify_password(req.password, user.password_hash):
-            raise HTTPException(status_code=401,detail="用户名或密码错误")
+    if not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401,detail="用户名或密码错误")
 
-        access_token,expire_time = create_access_token(data={"user_id": user.id, "username": user.username})
-        return {
-            "code":200,
-            "message":"success",
-            "data":{"access_token":access_token,"token_type":"bearer","expire_time":expire_time}
-        }
-    except Exception as e:
-        return {
-            "code":400,
-            "message":"服务器异常",
-            "data":{"error":str(e)}
-        }
-    except HTTPException as he:
-        raise he
+    access_token,expire_time = create_access_token(data={"user_id": user.id, "username": user.username})
+    return {
+        "code":200,
+        "message":"success",
+        "data":{"access_token":access_token,"token_type":"bearer","expire_time":expire_time}
+    }
 
 # OAuth2 兼容的登录端点（供 Swagger UI Authorize 使用）
 @app.post("/login/oauth", include_in_schema=False,response_model=None)
