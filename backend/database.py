@@ -91,7 +91,8 @@ def save_and_record(db, user_id: int, role: str, content: str):
 
 def get_chat_history(db, user_id: int, skip: int = 0, limit: int = 100):
     """
-    获取用户聊天记录
+    获取用户聊天记录（按时间升序，适合 /history 分页展示）
+
     param db：数据库会话
     param user_id:用户ID
     param skip:跳过多少条记录
@@ -104,6 +105,20 @@ def get_chat_history(db, user_id: int, skip: int = 0, limit: int = 100):
         .offset(skip)\
         .limit(limit)\
         .all()
+
+def get_latest_n_chat_history(db, user_id: int, n: int):
+    """
+    获取用户最近的 n 条聊天记录，按时间升序返回，用于上下文重建。
+
+    实现上用 ORDER BY DESC + LIMIT n 一次取最新 n 条，再反转成正向时间序。
+    这样 SQL 走索引一次就够，不必全表扫。
+    """
+    desc_records = db.query(ChatRecord)\
+        .filter(ChatRecord.user_id==user_id)\
+        .order_by(ChatRecord.create_time.desc())\
+        .limit(n)\
+        .all()
+    return list(reversed(desc_records))
 
 def delete_chat_history(db, user_id: int):
     """

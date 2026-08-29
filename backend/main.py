@@ -6,7 +6,7 @@ from ai_service import call_ai
 from pydantic import BaseModel,Field,EmailStr,StringConstraints
 from typing import Annotated
 from sqlalchemy.orm import Session
-from database import get_db,ChatRecord,save_and_record,get_chat_history,delete_chat_history,get_db,get_user_by_username,create_user,verify_password
+from database import get_db,ChatRecord,save_and_record,get_chat_history,get_latest_n_chat_history,delete_chat_history,get_db,get_user_by_username,create_user,verify_password
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
@@ -84,7 +84,7 @@ def chat_get(
     user_id = current_user.id
     # 如果内存上下文为空，从数据库加载最近记录重建上下文
     if user_id not in user_chat_history or not user_chat_history[user_id]:
-        records = get_chat_history(db, user_id, limit=20)
+        records = get_latest_n_chat_history(db, user_id, 20)
         user_chat_history[user_id] = [
             {"role": r.role, "content": r.content}
             for r in records
@@ -121,7 +121,7 @@ def chat_post(
     user_id = current_user.id
     # 如果内存上下文为空，从数据库加载最近记录重建上下文
     if user_id not in user_chat_history or not user_chat_history[user_id]:
-        records = get_chat_history(db, user_id, limit=20)
+        records = get_latest_n_chat_history(db, user_id, 20)
         user_chat_history[user_id] = [
             {"role": r.role, "content": r.content}
             for r in records
