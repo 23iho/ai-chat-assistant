@@ -244,6 +244,46 @@ function handleLogout() {
 // ==================== 聊天相关函数 ====================// 流式生成状态：保存当前请求的 AbortController，让 stop 按钮能中止
 let currentStreamController = null;
 
+
+// ===== Markdown 渲染 =====
+// 把纯文本渲染成 HTML（用于 AI 回复气泡）。
+// 用 DOMPurify 防 XSS，用 highlight.js 高亮代码块。
+// 流式渲染期间不调这个（会闪烁），等流结束再调。
+function renderMarkdown(text) {
+    if (!window.marked) {
+        // 降级：纯文本转义
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    const rawHtml = marked.parse(text, { breaks: true, gfm: true });
+    const cleanHtml = window.DOMPurify
+        ? DOMPurify.sanitize(rawHtml, { ADD_ATTR: ['target'] })
+        : rawHtml;
+    return cleanHtml;
+}
+
+function highlightCodeBlocks(container) {
+    if (!window.hljs) return;
+    container.querySelectorAll('pre code').forEach(block => {
+        try {
+            hljs.highlightElement(block);
+        } catch (e) {
+            console.warn('代码高亮失败:', e);
+        }
+    });
+}
+
+// 把一个 assistant 消息 div 从纯文本切换到 Markdown 渲染
+function rerenderAssistantMessageAsMarkdown(messageDiv) {
+    if (!messageDiv) return;
+    const text = messageDiv.textContent;  // 拿到当前累积的纯文本
+    messageDiv.innerHTML = renderMarkdown(text);
+    highlightCodeBlocks(messageDiv);
+    const box = document.getElementById('chatMessages');
+    if (box) box.scrollTop = box.scrollHeight;
+}
+
 // 停止当前生成
 function stopGeneration() {
     if (currentStreamController) {
@@ -386,6 +426,8 @@ async function sendMessage() {
                 } else if (payload.type === 'done') {
                     // 流结束；后端已经把完整内容存 DB
                     aiMsgDiv.classList.remove('streaming');
+                    // 把累积的纯文本换成 Markdown 渲染
+                    rerenderAssistantMessageAsMarkdown(aiMsgDiv);
                     // 刷新会话列表，让 updated_at 排到最前
                     loadConversationList();
                 }
@@ -410,21 +452,30 @@ async function sendMessage() {
 // 添加消息到聊天界面
 function addMessageToChat(role, content) {
     const chatMessages = document.getElementById('chatMessages');
-    if (!chatMessages) return;
-    
+    if (!chatMessages) return null;
+
     // 如果是第一条消息，移除欢迎消息
     if (chatMessages.querySelector('.welcome-message')) {
         chatMessages.innerHTML = '';
     }
-    
+
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${role}`;
-    messageDiv.textContent = content;
-    
+
+    // user / error 用纯文本（安全、所见即所得）
+    // assistant 走 Markdown 渲染（标题、列表、表格、代码块都好看）
+    if (role === 'assistant' && window.marked) {
+        messageDiv.innerHTML = renderMarkdown(content || '');
+        highlightCodeBlocks(messageDiv);
+    } else {
+        messageDiv.textContent = content;
+    }
+
     chatMessages.appendChild(messageDiv);
-    
+
     // 滚动到底部
     chatMessages.scrollTop = chatMessages.scrollHeight;
+    return messageDiv;
 }
 
 // 清空聊天历史
