@@ -41,7 +41,7 @@
 | AI 服务 | DashScope SDK 1.25+ | 阿里云官方，通义千问 Qwen 系列模型 |
 | 数据库 ORM | SQLAlchemy 2.0+ | 关系映射 + 连接池预检 |
 | 数据库 | MySQL 8.0 | utf8mb4 字符集 |
-| 认证 | python-jose + passlib/bcrypt | JWT (HS256) + bcrypt 加盐哈希 |
+| 认证 | python-jose + bcrypt | JWT (HS256) + bcrypt 加盐哈希 |
 | 数据校验 | Pydantic 2.x | 入参约束、EmailStr |
 | 前端 | 原生 HTML/CSS/JS | 无框架依赖，ReadbleStream + AbortController |
 

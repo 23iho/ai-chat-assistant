@@ -2,6 +2,8 @@ from fastapi import FastAPI,HTTPException,Depends,status,Form
 from fastapi.responses import JSONResponse,StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from ai_service import call_ai, stream_ai
 from pydantic import BaseModel,Field,EmailStr,StringConstraints
 from typing import Annotated
@@ -190,11 +192,28 @@ def _ensure_context_loaded(db, user_id: int, conversation_id: int) -> list:
 
 
 #全局异常捕获
-@app.exception_handler(Exception)
-async def global_exception_handler(request,exc):
+# 这里只兜底"没被任何路由处理的异常"。
+# HTTPException / RequestValidationError 走各自专用 handler，
+# 保持 REST 语义（401 / 404 / 422 真实状态码），不被吞成 200。
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request, exc):
     return JSONResponse(
-        status_code=200,
-        content={"code":400,"message":f"服务器异常：{str(exc)}","data":{"error":str(exc)}}
+        status_code=exc.status_code,
+        content={"code": exc.status_code, "message": exc.detail, "data": None},
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=422,
+        content={"code": 422, "message": "参数校验失败", "data": {"errors": exc.errors()}},
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={"code": 500, "message": f"服务器异常：{str(exc)}", "data": {"error": str(exc)}},
     )
 #健康检查接口：用来判断服务是否正常运行
 @app.get("/",tags=["系统接口"])

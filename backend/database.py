@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine,Column,Integer,String,Text,DateTime,ForeignKey,Index,inspect,text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
-from passlib.context import CryptContext
+import bcrypt
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -26,7 +26,9 @@ Base = declarative_base()
 SessionLocal = sessionmaker(autocommit=False,autoflush=False,bind=engine)
 
 #创建密码加密上下文
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# 注：原本用 passlib，但它跟新版本 bcrypt (≥3.2) 不兼容，
+# 直接用 bcrypt 包更稳。bcrypt 单向 72 字节限制由我们手动处理。
+_BCRYPT_MAX_LEN = 72
 class User(Base):
     __tablename__ = "users"  #指定表名
 
@@ -38,9 +40,19 @@ class User(Base):
 
 #密码加密与验证
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    # bcrypt 单向 72 字节截断；超长密码直接拒绝，
+    # Pydantic 那层 max_length=100 不会让这里被滥用
+    pwd_bytes = password.encode("utf-8")[:_BCRYPT_MAX_LEN]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    pwd_bytes = plain_password.encode("utf-8")[:_BCRYPT_MAX_LEN]
+    try:
+        return bcrypt.checkpw(pwd_bytes, hashed_password.encode("utf-8"))
+    except ValueError:
+        # hash 字符串非法
+        return False
 #用户查询与注册
 def get_user_by_username(db,username: str):
     return db.query(User).filter(User.username == username).first()
