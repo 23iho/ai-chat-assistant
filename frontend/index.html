@@ -318,6 +318,55 @@
             background: #ff9500;
         }
 
+        /* 流式生成中的占位气泡 */
+        .message.streaming {
+            position: relative;
+        }
+        .message.streaming::after {
+            content: '▍';
+            margin-left: 2px;
+            animation: blink 1s steps(1) infinite;
+            color: #667eea;
+        }
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+        /* 三点跳动 loading */
+        .typing-dots {
+            display: inline-flex;
+            gap: 4px;
+            align-items: center;
+        }
+        .typing-dots span {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #667eea;
+            animation: dotBounce 1.2s infinite ease-in-out;
+        }
+        .typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+        .typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+        @keyframes dotBounce {
+            0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+            40% { transform: translateY(-4px); opacity: 1; }
+        }
+        /* 停止生成按钮：发送中替换发送按钮 */
+        .btn-stop {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 15px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            white-space: nowrap;
+        }
+        .btn-stop:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(238, 90, 82, 0.4);
+        }
+
         /* 动画 */
         @keyframes fadeIn {
             from {
@@ -459,13 +508,14 @@
 
             <div class="chat-input-area">
                 <div class="input-wrapper">
-                    <textarea 
-                        class="chat-input" 
-                        id="messageInput" 
+                    <textarea
+                        class="chat-input"
+                        id="messageInput"
                         placeholder="输入消息... (按 Enter 发送，Shift+Enter 换行)"
                         rows="1"
                     ></textarea>
-                    <button class="btn-send" onclick="sendMessage()">发 送</button>
+                    <button class="btn-send" id="btnSend" onclick="sendMessage()">发 送</button>
+                    <button class="btn-stop" id="btnStop" onclick="stopGeneration()" style="display:none;">停 止</button>
                 </div>
                 <button class="btn-clear" onclick="clearHistory()">清空聊天记录</button>
             </div>

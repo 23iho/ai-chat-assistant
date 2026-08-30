@@ -218,49 +218,144 @@ function handleLogout() {
 
 // ==================== 聊天相关函数 ====================
 
-// 发送消息
+// 流式生成状态：保存当前请求的 AbortController，让 stop 按钮能中止
+let currentStreamController = null;
+
+// 停止当前生成
+function stopGeneration() {
+    if (currentStreamController) {
+        currentStreamController.abort();
+        currentStreamController = null;
+    }
+    setStreamingUI(false);
+}
+
+// 切换 UI：发送中时禁用输入，显示停止按钮
+function setStreamingUI(isStreaming) {
+    const btnSend = document.getElementById('btnSend');
+    const btnStop = document.getElementById('btnStop');
+    const input = document.getElementById('messageInput');
+    if (btnSend) btnSend.style.display = isStreaming ? 'none' : '';
+    if (btnStop) btnStop.style.display = isStreaming ? '' : 'none';
+    if (input) input.disabled = isStreaming;
+}
+
+// 解析 SSE 一段 buffer，返回 [{event, data}, ...] 与剩余 buffer
+function parseSSEChunk(buffer) {
+    const events = [];
+    let idx;
+    // 用 \n\n 切分事件块
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const raw = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const lines = raw.split('\n');
+        const dataLines = lines
+            .filter(l => l.startsWith('data:'))
+            .map(l => l.slice(5).trim());
+        if (dataLines.length === 0) continue;
+        events.push(dataLines.join('\n'));
+    }
+    return { events, rest: buffer };
+}
+
+// 发送消息（流式）
 async function sendMessage() {
     const input = document.getElementById('messageInput');
     if (!input) return;
-    
-    const message = input.value.trim();
 
-    if (!message) {
-        return;
-    }
+    const message = input.value.trim();
+    if (!message) return;
 
     // 清空输入框并重置高度
     input.value = '';
     input.style.height = 'auto';
 
-    // 显示用户消息
     addMessageToChat('user', message);
 
+    // 创建 AI 回复占位（带 streaming class 显示光标动画）
+    const aiMsgDiv = addMessageToChat('assistant', '');
+    aiMsgDiv.classList.add('streaming');
+
+    // 切换 UI 状态
+    setStreamingUI(true);
+    currentStreamController = new AbortController();
+
+    let fullContent = '';
+    let buffer = '';
+
     try {
-        const response = await fetch(`${API_BASE_URL}/chat`, {
+        const response = await fetch(`${API_BASE_URL}/chat/stream`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Authorization': `Bearer ${authToken}`,
             },
-            body: JSON.stringify({
-                message: message,
-                clear_history: false
-            })
+            body: JSON.stringify({ message: message, clear_history: false }),
+            signal: currentStreamController.signal,
         });
 
-        const data = await response.json();
+        // 401 直接跳登录（之前 token 过期是静默失败）
+        if (response.status === 401) {
+            showError('登录已过期，请重新登录');
+            handleLogout();
+            return;
+        }
 
-        if (data.code === 200) {
-            addMessageToChat('assistant', data.data.ai);
-            // 刷新聊天记录
-            loadChatHistory();
-        } else {
-            addMessageToChat('error', `错误: ${data.message}`);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const { events, rest } = parseSSEChunk(buffer);
+            buffer = rest;
+
+            for (const evt of events) {
+                if (evt === '[DONE]') continue;
+                let payload;
+                try {
+                    payload = JSON.parse(evt);
+                } catch (e) {
+                    console.warn('SSE JSON 解析失败:', evt);
+                    continue;
+                }
+
+                if (payload.type === 'content') {
+                    fullContent += payload.text;
+                    aiMsgDiv.textContent = fullContent;
+                    // 自动滚到底
+                    const box = document.getElementById('chatMessages');
+                    if (box) box.scrollTop = box.scrollHeight;
+                } else if (payload.type === 'error') {
+                    aiMsgDiv.classList.remove('streaming');
+                    aiMsgDiv.classList.add('error');
+                    aiMsgDiv.textContent = `错误: ${payload.message}`;
+                } else if (payload.type === 'info') {
+                    aiMsgDiv.textContent = payload.message;
+                } else if (payload.type === 'done') {
+                    // 流结束；后端已经把完整内容存 DB，这里只需去掉 streaming class
+                    aiMsgDiv.classList.remove('streaming');
+                }
+            }
         }
     } catch (error) {
-        console.error('发送消息错误:', error);
-        addMessageToChat('error', '网络错误，请稍后重试');
+        if (error.name === 'AbortError') {
+            aiMsgDiv.classList.remove('streaming');
+            aiMsgDiv.textContent = (fullContent || '') + (fullContent ? '\n\n[已停止生成]' : '[已停止生成]');
+        } else {
+            console.error('发送消息错误:', error);
+            aiMsgDiv.classList.remove('streaming');
+            aiMsgDiv.classList.add('error');
+            aiMsgDiv.textContent = `网络错误：${error.message || error}`;
+        }
+    } finally {
+        currentStreamController = null;
+        setStreamingUI(false);
     }
 }
 
