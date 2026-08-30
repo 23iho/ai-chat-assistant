@@ -1,13 +1,14 @@
 from fastapi import FastAPI,HTTPException,Depends,status,Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse,StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from ai_service import call_ai
+from ai_service import call_ai, stream_ai
 from pydantic import BaseModel,Field,EmailStr,StringConstraints
 from typing import Annotated
 from sqlalchemy.orm import Session
 from database import get_db,ChatRecord,save_and_record,get_chat_history,get_latest_n_chat_history,delete_chat_history,get_db,get_user_by_username,create_user,verify_password
 from datetime import datetime, timedelta
+import json
 
 from sqlalchemy.orm import Session
 from auth import create_access_token,get_current_user
@@ -218,6 +219,82 @@ def chat_post(
         "message": "success",
         "data": {"user": req.message, "ai": answer}
     }
+
+
+# ===== SSE 流式聊天 =====
+# 与 /chat 阻塞式不同，/chat/stream 在 AI 边生成时边把 chunk 推给前端，
+# 前端拿到一个 chunk 就更新一次 UI，首字延迟从"等全文"降到"等第一个字"。
+@app.post("/chat/stream", tags=["聊天接口"], summary="SSE 流式聊天（需登录）")
+def chat_stream(
+    req: ChatRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    user_id = current_user.id
+
+    # clear_history 直接清空上下文（不影响 DB 历史，前端可单独调 DELETE /history）
+    if req.clear_history:
+        user_chat_history.clear(user_id)
+        # 用 SSE 返回一个事件告诉前端"已清空"
+        def cleared():
+            payload = json.dumps({"type": "info", "message": "上下文已清空"}, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(
+            cleared(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # 重建上下文（从 DB 拿最近 20 条）
+    if not user_chat_history.get(user_id):
+        records = get_latest_n_chat_history(db, user_id, 20)
+        history = [{"role": r.role, "content": r.content} for r in records]
+        # 复用 cache 的 _store 以便后续 append_message 也能写进去
+        user_chat_history._store[user_id] = history
+
+    # 先把"未追加 user 消息"的历史快照存下来，传给 stream_ai
+    # （stream_ai 内部会自己拼 user 消息，避免双写）
+    history_snapshot = list(user_chat_history.get(user_id))
+
+    # 先把用户消息存 DB + 上下文（即使后面 stream 中途断开，用户消息也不丢）
+    save_and_record(db, user_id=user_id, role="user", content=req.message)
+    user_chat_history.append_message(user_id, "user", req.message)
+
+    # 把流式生成器 + 落库逻辑绑在一起
+    def event_generator():
+        full_content_parts = []
+        try:
+            for chunk in stream_ai(req.message, history_snapshot):
+                full_content_parts.append(chunk)
+                payload = json.dumps({"type": "content", "text": chunk}, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+        except RuntimeError as e:
+            err_payload = json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+            yield f"data: {err_payload}\n\n"
+            return
+        except Exception as e:
+            err_payload = json.dumps({"type": "error", "message": f"系统错误：{e}"}, ensure_ascii=False)
+            yield f"data: {err_payload}\n\n"
+            return
+
+        full_content = "".join(full_content_parts)
+        if full_content:
+            save_and_record(db, user_id=user_id, role="assistant", content=full_content)
+            user_chat_history.append_message(user_id, "assistant", full_content)
+
+        done_payload = json.dumps({"type": "done"}, ensure_ascii=False)
+        yield f"data: {done_payload}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 关掉 nginx 之类的缓冲，保证实时
+        },
+    )
+
 
 #添加聊天记录查询接口
 @app.get("/history", tags=["聊天记录接口"], summary="查询我的聊天记录（需登录）")
