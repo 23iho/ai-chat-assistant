@@ -1,0 +1,84 @@
+# 一键启动整个项目（FastAPI + MySQL + Adminer）
+#
+# 用法：
+#   1. cp .env.example .env   填好 DASH_SCOPE_API_KEY / JWT_SECRET / MYSQL_ROOT_PASSWORD
+#   2. docker compose up -d --build
+#   3. 浏览器打开 http://localhost:8000/docs  看 API
+#      浏览器打开 http://localhost:8081        用 Adminer 看数据库（系统 MySQL / root / 你设的密码）
+#      浏览器打开 http://localhost:8080        前端（另起一个容器或者本地 start.bat）
+#
+# 停止：docker compose down        （保留数据卷）
+# 彻底清理：docker compose down -v   （删数据卷，会丢所有聊天记录）
+
+services:
+  app:
+    build: ./backend
+    container_name: ai-chat-app
+    ports:
+      - "8000:8000"
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 未设置，请先在 .env 里填好}
+      DB_NAME: ai_chat_db
+      DASH_SCOPE_API_KEY: ${DASH_SCOPE_API_KEY:?DASH_SCOPE_API_KEY 未设置}
+      QWEN_MODEL: ${QWEN_MODEL:-qwen-turbo}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 未设置}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      DB_ECHO: "0"
+      TZ: Asia/Shanghai
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ai-chat-net
+
+  mysql:
+    image: mysql:8.0
+    container_name: ai-chat-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ai_chat_db
+      TZ: Asia/Shanghai
+    ports:
+      # 想从宿主机直接连 MySQL 调试就放开；纯容器内通信可以注释掉
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=caching_sha2_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - ai-chat-net
+
+  # 可选的数据库 GUI（看心情要不要）
+  adminer:
+    image: adminer:latest
+    container_name: ai-chat-adminer
+    ports:
+      - "8081:8080"
+    depends_on:
+      - mysql
+    restart: unless-stopped
+    networks:
+      - ai-chat-net
+
+volumes:
+  mysql_data:
+    name: ai-chat-mysql-data
+
+networks:
+  ai-chat-net:
+    name: ai-chat-net
+    driver: bridge
