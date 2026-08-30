@@ -4,6 +4,8 @@ const API_BASE_URL = 'http://127.0.0.1:8000';
 // 全局状态
 let authToken = localStorage.getItem('auth_token') || null;
 let currentUser = JSON.parse(localStorage.getItem('current_user') || 'null');
+let conversations = [];  // [{id, title, updated_at, ...}]
+let currentConversationId = null;  // 当前激活的会话 ID
 
 // 页面初始化
 document.addEventListener('DOMContentLoaded', function() {
@@ -65,13 +67,33 @@ function showChatPage() {
     const authPage = document.getElementById('authPage');
     const chatPage = document.getElementById('chatPage');
     const currentUsername = document.getElementById('currentUsername');
-    
+
     if (authPage) authPage.style.display = 'none';
     if (chatPage) chatPage.classList.add('active');
     if (currentUsername && currentUser) {
         currentUsername.textContent = `欢迎，${currentUser.username}`;
     }
-    loadChatHistory();
+    // 先拉会话列表，再加载当前会话的历史
+    loadConversationList().then(() => {
+        if (!currentConversationId) {
+            // 没有激活会话：选列表里最近的一个，否则新建
+            if (conversations.length > 0) {
+                switchConversation(conversations[0].id);
+            } else {
+                createNewConversation();
+            }
+        } else {
+            // 校验当前会话是否还存在
+            const exists = conversations.some(c => c.id === currentConversationId);
+            if (exists) {
+                switchConversation(currentConversationId);
+            } else if (conversations.length > 0) {
+                switchConversation(conversations[0].id);
+            } else {
+                createNewConversation();
+            }
+        }
+    });
 }
 
 // 显示错误信息
@@ -204,10 +226,13 @@ function handleLogout() {
     if (confirm('确定要退出登录吗？')) {
         authToken = null;
         currentUser = null;
+        conversations = [];
+        currentConversationId = null;
         localStorage.removeItem('auth_token');
         localStorage.removeItem('current_user');
+        localStorage.removeItem('current_conv_id');
         showAuthPage();
-        
+
         // 清空输入框
         const loginUsername = document.getElementById('loginUsername');
         const loginPassword = document.getElementById('loginPassword');
@@ -216,9 +241,7 @@ function handleLogout() {
     }
 }
 
-// ==================== 聊天相关函数 ====================
-
-// 流式生成状态：保存当前请求的 AbortController，让 stop 按钮能中止
+// ==================== 聊天相关函数 ====================// 流式生成状态：保存当前请求的 AbortController，让 stop 按钮能中止
 let currentStreamController = null;
 
 // 停止当前生成
@@ -290,7 +313,12 @@ async function sendMessage() {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${authToken}`,
             },
-            body: JSON.stringify({ message: message, clear_history: false }),
+            // conversation_id 为空时，后端会自动新建一个并通过 init 事件回传
+            body: JSON.stringify({
+                message: message,
+                conversation_id: currentConversationId,
+                clear_history: false,
+            }),
             signal: currentStreamController.signal,
         });
 
@@ -325,7 +353,25 @@ async function sendMessage() {
                     continue;
                 }
 
-                if (payload.type === 'content') {
+                if (payload.type === 'init') {
+                    // 后端告诉我们这条消息属于哪个会话（可能是新建的）
+                    if (payload.conversation_id !== currentConversationId) {
+                        currentConversationId = payload.conversation_id;
+                        localStorage.setItem('current_conv_id', String(currentConversationId));
+                        const titleEl = document.getElementById('currentConvTitle');
+                        if (titleEl) titleEl.textContent = payload.conversation_title || '';
+                        // 把新会话插到列表顶部
+                        const exists = conversations.some(c => c.id === currentConversationId);
+                        if (!exists) {
+                            conversations.unshift({
+                                id: payload.conversation_id,
+                                title: payload.conversation_title || '新对话',
+                                updated_at: new Date().toISOString().replace('T', ' ').slice(0, 19),
+                            });
+                            renderConversationList();
+                        }
+                    }
+                } else if (payload.type === 'content') {
                     fullContent += payload.text;
                     aiMsgDiv.textContent = fullContent;
                     // 自动滚到底
@@ -338,8 +384,10 @@ async function sendMessage() {
                 } else if (payload.type === 'info') {
                     aiMsgDiv.textContent = payload.message;
                 } else if (payload.type === 'done') {
-                    // 流结束；后端已经把完整内容存 DB，这里只需去掉 streaming class
+                    // 流结束；后端已经把完整内容存 DB
                     aiMsgDiv.classList.remove('streaming');
+                    // 刷新会话列表，让 updated_at 排到最前
+                    loadConversationList();
                 }
             }
         }
@@ -470,7 +518,7 @@ async function toggleHistory() {
     }
 }
 
-// 加载历史记录列表
+// 加载历史记录列表（历史侧边栏，老接口保留兼容）
 async function loadHistoryList() {
     try {
         const response = await fetch(`${API_BASE_URL}/history?skip=0&limit=100`, {
@@ -486,23 +534,18 @@ async function loadHistoryList() {
             if (!historyList) return;
 
             historyList.innerHTML = '';
-            
+
             if (data.data.history.length === 0) {
                 historyList.innerHTML = '<p style="text-align: center; color: #999; padding: 20px;">暂无聊天记录</p>';
                 return;
             }
-            
-            // 按时间倒序显示
+
             const reversedHistory = [...data.data.history].reverse();
-            
+
             reversedHistory.forEach(record => {
                 const item = document.createElement('div');
                 item.className = 'history-item';
 
-                // 之前用 innerHTML 拼 record.content 是存储型 XSS：
-                // 用户发一条 <img src=x onerror=alert(1)> 就会被持久化，
-                // 下次任何人打开侧边栏都会触发（主聊天区用 textContent 是安全的）。
-                // 改成 createElement + textContent，浏览器自动转义。
                 const roleEl = document.createElement('div');
                 roleEl.className = 'role';
                 roleEl.textContent = record.role === 'user' ? '👤 我' : '🤖 AI';
@@ -510,7 +553,7 @@ async function loadHistoryList() {
                 const contentEl = document.createElement('div');
                 contentEl.className = 'content';
                 contentEl.textContent = record.content;
-                contentEl.title = record.content;  // 鼠标悬停看完整内容
+                contentEl.title = record.content;
 
                 const timeEl = document.createElement('div');
                 timeEl.className = 'time';
@@ -524,5 +567,230 @@ async function loadHistoryList() {
         }
     } catch (error) {
         console.error('加载历史列表错误:', error);
+    }
+}
+
+
+// ==================== 会话（Conversation）管理 ====================
+
+// 从 localStorage 恢复上次激活的会话
+function restoreCurrentConversationId() {
+    const saved = localStorage.getItem('current_conv_id');
+    if (saved) currentConversationId = parseInt(saved, 10) || null;
+}
+
+
+// 加载并渲染会话列表
+async function loadConversationList() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/conversations?limit=100`, {
+            headers: { 'Authorization': `Bearer ${authToken}` },
+        });
+        const data = await response.json();
+        if (data.code === 200) {
+            conversations = data.data.conversations || [];
+            renderConversationList();
+        }
+    } catch (error) {
+        console.error('加载会话列表错误:', error);
+    }
+}
+
+
+// 把会话列表画到侧边栏
+function renderConversationList() {
+    const listEl = document.getElementById('convList');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+
+    if (conversations.length === 0) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding:20px;text-align:center;color:#999;font-size:13px;';
+        empty.textContent = '还没有会话，点上方按钮开聊吧~';
+        listEl.appendChild(empty);
+        return;
+    }
+
+    conversations.forEach(c => {
+        const item = document.createElement('div');
+        item.className = 'conv-item' + (c.id === currentConversationId ? ' active' : '');
+        item.dataset.id = c.id;
+
+        const titleEl = document.createElement('span');
+        titleEl.className = 'conv-title';
+        titleEl.textContent = c.title || '新对话';
+        titleEl.title = c.title;
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'conv-del';
+        delBtn.textContent = '×';
+        delBtn.title = '删除会话';
+        delBtn.onclick = (e) => {
+            e.stopPropagation();  // 阻止冒泡触发切换
+            deleteConversation(c.id);
+        };
+
+        item.onclick = () => switchConversation(c.id);
+
+        item.appendChild(titleEl);
+        item.appendChild(delBtn);
+        listEl.appendChild(item);
+    });
+}
+
+
+// 切换到指定会话
+async function switchConversation(convId) {
+    if (convId === currentConversationId) return;
+    currentConversationId = convId;
+    localStorage.setItem('current_conv_id', String(convId));
+
+    const titleEl = document.getElementById('currentConvTitle');
+    const conv = conversations.find(c => c.id === convId);
+    if (titleEl) titleEl.textContent = conv ? conv.title : '';
+
+    renderConversationList();  // 更新高亮
+    await loadMessagesOfConversation(convId);
+}
+
+
+// 加载某个会话的所有消息到聊天框
+async function loadMessagesOfConversation(convId) {
+    const chatMessages = document.getElementById('chatMessages');
+    if (!chatMessages) return;
+    chatMessages.innerHTML = '';
+
+    try {
+        const response = await fetch(
+            `${API_BASE_URL}/history?skip=0&limit=200&conversation_id=${convId}`,
+            { headers: { 'Authorization': `Bearer ${authToken}` } }
+        );
+        const data = await response.json();
+
+        if (data.code === 200) {
+            if (data.data.history.length === 0) {
+                addWelcomeMessage();
+            } else {
+                data.data.history.forEach(r => addMessageToChat(r.role, r.content));
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+        }
+    } catch (error) {
+        console.error('加载会话历史错误:', error);
+        addWelcomeMessage();
+    }
+}
+
+
+// 新建会话
+async function createNewConversation() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/conversations`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${authToken}`,
+            },
+            body: JSON.stringify({}),
+        });
+        const data = await response.json();
+        if (data.code === 200) {
+            const conv = {
+                id: data.data.id,
+                title: data.data.title,
+                updated_at: data.data.created_at,
+            };
+            conversations.unshift(conv);
+            await switchConversation(conv.id);
+        }
+    } catch (error) {
+        console.error('新建会话错误:', error);
+        showError('新建会话失败，请重试');
+    }
+}
+
+
+// 删除会话
+async function deleteConversation(convId) {
+    const conv = conversations.find(c => c.id === convId);
+    if (!conv) return;
+    if (!confirm(`确定删除会话「${conv.title}」？消息会一起被删掉。`)) return;
+
+    try {
+        const response = await fetch(`${API_BASE_URL}/conversations/${convId}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${authToken}` },
+        });
+        const data = await response.json();
+        if (data.code === 200) {
+            // 从本地列表里移除
+            conversations = conversations.filter(c => c.id !== convId);
+            // 如果删的就是当前会话，切到列表里下一个或新建
+            if (convId === currentConversationId) {
+                if (conversations.length > 0) {
+                    await switchConversation(conversations[0].id);
+                } else {
+                    await createNewConversation();
+                }
+            } else {
+                renderConversationList();
+            }
+        } else {
+            showError(data.message || '删除失败');
+        }
+    } catch (error) {
+        console.error('删除会话错误:', error);
+        showError('网络错误，请重试');
+    }
+}
+
+
+// 清空当前会话（消息全删，会话保留）
+async function clearCurrentConversation() {
+    if (!currentConversationId) return;
+    if (!confirm('确定清空当前会话的所有消息？')) return;
+    try {
+        const response = await fetch(
+            `${API_BASE_URL}/history?conversation_id=${currentConversationId}`,
+            {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${authToken}` },
+            }
+        );
+        const data = await response.json();
+        if (data.code === 200) {
+            const chatMessages = document.getElementById('chatMessages');
+            if (chatMessages) chatMessages.innerHTML = '';
+            addWelcomeMessage();
+        } else {
+            showError(data.message || '清空失败');
+        }
+    } catch (error) {
+        console.error('清空会话错误:', error);
+        showError('网络错误，请重试');
+    }
+}
+
+
+// 移动端侧边栏抽屉
+function toggleSidebar() {
+    const sb = document.getElementById('convSidebar');
+    if (sb) sb.classList.toggle('open');
+}
+
+
+// 页面初始化时尝试恢复当前会话 ID
+restoreCurrentConversationId();
+
+
+// 兼容旧函数名（避免之前清空按钮的 onclick 引用报错）
+async function clearHistory() {
+    return clearCurrentConversation();
+}
+async function loadChatHistory() {
+    if (currentConversationId) {
+        await loadMessagesOfConversation(currentConversationId);
+    } else {
+        addWelcomeMessage();
     }
 }
