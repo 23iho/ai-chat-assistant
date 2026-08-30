@@ -6,7 +6,24 @@ from ai_service import call_ai, stream_ai
 from pydantic import BaseModel,Field,EmailStr,StringConstraints
 from typing import Annotated
 from sqlalchemy.orm import Session
-from database import get_db,ChatRecord,save_and_record,get_chat_history,get_latest_n_chat_history,delete_chat_history,get_db,get_user_by_username,create_user,verify_password
+from database import (
+    get_db,
+    ChatRecord,
+    Conversation,
+    save_and_record,
+    get_chat_history,
+    get_latest_n_chat_history,
+    delete_chat_history,
+    list_conversations,
+    get_conversation,
+    create_conversation,
+    rename_conversation,
+    delete_conversation,
+    touch_conversation,
+    get_user_by_username,
+    create_user,
+    verify_password,
+)
 from datetime import datetime, timedelta
 import json
 
@@ -35,7 +52,16 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     """聊天请求体模型"""
     message: Annotated[str, StringConstraints(max_length=1000)] = Field(..., description="用户输入的消息")
+    conversation_id: int | None = Field(None, description="所属会话ID；为空时自动创建")
     clear_history: bool = Field(False, description="是否清空上下文")
+
+
+class ConversationCreate(BaseModel):
+    title: str | None = Field(None, max_length=200, description="会话标题，可空（用首条消息生成）")
+
+
+class ConversationRename(BaseModel):
+    title: Annotated[str, StringConstraints(min_length=1, max_length=200)] = Field(..., description="新标题")
 #定义用户注册模型
 class UserRegister(BaseModel):
     username: Annotated[str, StringConstraints(min_length=3, max_length=20)] = Field(..., description="用户名")
@@ -48,7 +74,9 @@ class UserLogin(BaseModel):
 
 
 class UserContextCache:
-    """进程内用户上下文缓存（最近 N 轮对话）。
+    """进程内的 (用户, 会话) 上下文缓存（最近 N 轮对话）。
+
+    key 用 (user_id, conversation_id) 元组，避免切会话时上下文串台。
 
     ⚠️ 已知限制（写进 README "Known Issues"）：
     - 单进程内存，重启即丢，下次访问从 DB 回填
@@ -58,60 +86,72 @@ class UserContextCache:
     这里先做一个简单的有界实现，防止长期运行内存无限增长。
     """
 
-    # 单 worker 最多保留多少用户的活跃上下文；超出会按 LRU 淘汰最久未访问的。
-    # 设为 0 表示不淘汰（仅用于 debug）。
-    MAX_USERS = 1000
+    # 单 worker 最多保留多少个 (user, conv) 的活跃上下文；
+    # 超出按 LRU 淘汰最久未访问的。设为 0 表示不淘汰（仅用于 debug）。
+    MAX_KEYS = 1000
 
     def __init__(self, max_window: int = 20):
-        self._store: dict[int, list] = {}
-        self._access_order: list[int] = []  # 头部最久未访问，尾部最新
+        self._store: dict[tuple[int, int | None], list] = {}
+        self._access_order: list[tuple[int, int | None]] = []
         self.max_window = max_window
 
-    def get(self, user_id: int) -> list:
-        """获取用户上下文窗口，未命中时初始化为空列表。"""
-        if user_id not in self._store:
+    def _key(self, user_id: int, conversation_id: int | None) -> tuple[int, int | None]:
+        return (user_id, conversation_id)
+
+    def get(self, user_id: int, conversation_id: int | None = None) -> list:
+        """获取 (user, conv) 上下文窗口，未命中时初始化为空列表。"""
+        k = self._key(user_id, conversation_id)
+        if k not in self._store:
             self._evict_if_needed()
-            self._store[user_id] = []
-        self._touch(user_id)
-        return self._store[user_id]
+            self._store[k] = []
+        self._touch(k)
+        return self._store[k]
 
-    def clear(self, user_id: int) -> None:
-        """清空指定用户的上下文窗口。"""
-        self._store[user_id] = []
-        self._touch(user_id)
+    def clear(self, user_id: int, conversation_id: int | None = None) -> None:
+        """清空指定 (user, conv) 的上下文窗口。"""
+        k = self._key(user_id, conversation_id)
+        self._store[k] = []
+        self._touch(k)
 
-    def append_message(self, user_id: int, role: str, content: str) -> None:
+    def append_message(self, user_id: int, conversation_id: int | None,
+                       role: str, content: str) -> None:
         """追加一条消息并按窗口长度截断。"""
-        window = self.get(user_id)
+        window = self.get(user_id, conversation_id)
         window.append({"role": role, "content": content})
         if len(window) > self.max_window:
-            # 只保留最后 max_window 条
-            self._store[user_id] = window[-self.max_window:]
-        self._touch(user_id)
+            self._store[self._key(user_id, conversation_id)] = window[-self.max_window:]
+        self._touch(self._key(user_id, conversation_id))
 
-    def evict(self, user_id: int) -> None:
-        """主动移除某个用户（用于账号注销等场景）。"""
-        self._store.pop(user_id, None)
-        if user_id in self._access_order:
-            self._access_order.remove(user_id)
+    def evict_user(self, user_id: int) -> None:
+        """主动移除某个用户的所有会话（用于账号注销等场景）。"""
+        keys = [k for k in self._store if k[0] == user_id]
+        for k in keys:
+            self._store.pop(k, None)
+        self._access_order = [k for k in self._access_order if k[0] != user_id]
+
+    def evict_conversation(self, user_id: int, conversation_id: int | None) -> None:
+        k = self._key(user_id, conversation_id)
+        self._store.pop(k, None)
+        if k in self._access_order:
+            self._access_order.remove(k)
 
     def stats(self) -> dict:
         """便于调试 / 监控。"""
         return {
-            "active_users": len(self._store),
-            "max_users": self.MAX_USERS,
+            "active_keys": len(self._store),
+            "max_keys": self.MAX_KEYS,
             "max_window": self.max_window,
         }
 
-    def _touch(self, user_id: int) -> None:
-        if user_id in self._access_order:
-            self._access_order.remove(user_id)
-        self._access_order.append(user_id)
+    def _touch(self, k: tuple[int, int | None]) -> None:
+        if k in self._access_order:
+            self._access_order.remove(k)
+        self._access_order.append(k)
 
     def _evict_if_needed(self) -> None:
-        if self.MAX_USERS <= 0:
+        if self.MAX_KEYS <= 0:
             return
-        while len(self._store) >= self.MAX_USERS and self._access_order:
+        while len(self._store) >= self.MAX_KEYS and self._access_order:
             oldest = self._access_order.pop(0)
             self._store.pop(oldest, None)
 
@@ -120,13 +160,34 @@ class UserContextCache:
 user_chat_history = UserContextCache(max_window=20)
 
 
-# 兼容旧调用：让 main.py 里的 get_user_history / clear_user_history 仍然可用
-def get_user_history(user_id: int) -> list:
-    return user_chat_history.get(user_id)
+# ===== 共用辅助函数 =====
+
+def _resolve_conversation(db, current_user, conversation_id: int | None,
+                          first_message: str | None = None) -> Conversation:
+    """根据 conversation_id 拿到当前用户的会话。
+
+    - 如果传了 ID 且属于当前用户 → 返回
+    - 否则新建一个（标题用首条消息的前 30 字，或 "新对话"）
+    """
+    if conversation_id is not None:
+        conv = get_conversation(db, conversation_id, current_user.id)
+        if conv:
+            return conv
+    title = (first_message or "新对话")[:30]
+    return create_conversation(db, current_user.id, title)
 
 
-def clear_user_history(user_id: int) -> None:
-    user_chat_history.clear(user_id)
+def _ensure_context_loaded(db, user_id: int, conversation_id: int) -> list:
+    """从 DB 加载该会话最近 20 条到内存上下文（首次访问时）。"""
+    key = (user_id, conversation_id)
+    if not user_chat_history._store.get(key):
+        records = get_latest_n_chat_history(db, user_id, 20, conversation_id=conversation_id)
+        user_chat_history._store[key] = [
+            {"role": r.role, "content": r.content} for r in records
+        ]
+        user_chat_history._touch(key)
+    return user_chat_history._store[key]
+
 
 #全局异常捕获
 @app.exception_handler(Exception)
@@ -144,80 +205,65 @@ def health_check():
         "data":{"status":"ok","message":"AI聊天助手服务已启动"}
         }
 
-#定义get方式聊天接口
-#@app.get("/chat")：接口路径是/chat.访问http://127.0.0.1:8000/chat就会到这里
-#tags=["聊天接口"]：分类到聊天接口
-@app.get("/chat", tags=["聊天接口"], summary="GET聊天（需登录）")
+#定义get方式聊天接口（保留用于 Swagger 演示和单元测试）
+# 注意：GET 请求会把消息写到 URL 里（access log / 浏览器历史），
+# 实际使用请走 POST /chat 或 POST /chat/stream。
+@app.get("/chat", tags=["聊天接口"], summary="GET聊天（需登录，仅供演示）")
 def chat_get(
     message: str,
+    conversation_id: int | None = None,
     clear_history: bool = False,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
     user_id = current_user.id
-    # 如果内存上下文为空，从数据库加载最近记录重建上下文
-    if user_id not in user_chat_history or not user_chat_history[user_id]:
-        records = get_latest_n_chat_history(db, user_id, 20)
-        user_chat_history[user_id] = [
-            {"role": r.role, "content": r.content}
-            for r in records
-        ]
-    user_history = get_user_history(user_id)
+    conv = _resolve_conversation(db, current_user, conversation_id, first_message=message)
+    user_history = _ensure_context_loaded(db, user_id, conv.id)
     if clear_history:
-        clear_user_history(user_id)
-        return {
-            "code": 200,
-            "message": "success",
-            "data": {"message": "上下文已清空"}
-        }
+        user_chat_history.clear(user_id, conv.id)
+        return {"code": 200, "message": "success", "data": {"message": "上下文已清空"}}
     answer = call_ai(message, user_history)
-    save_and_record(db, user_id, "user", message)
-    save_and_record(db, user_id, "assistant", answer)
-    user_history.append({"role": "user", "content": message})
-    user_history.append({"role": "assistant", "content": answer})
-    if len(user_history) > 20:
-        user_chat_history[user_id] = user_history[-20:]
+    save_and_record(db, user_id, "user", message, conversation_id=conv.id)
+    save_and_record(db, user_id, "assistant", answer, conversation_id=conv.id)
+    user_chat_history.append_message(user_id, conv.id, "user", message)
+    user_chat_history.append_message(user_id, conv.id, "assistant", answer)
+    touch_conversation(db, conv.id)
     return {
         "code": 200,
         "message": "success",
-        "data": {"user": message, "ai": answer}
+        "data": {
+            "user": message, "ai": answer,
+            "conversation_id": conv.id, "conversation_title": conv.title,
+        }
     }
 
 #添加post请求接口
-#@app.post("/chat"):定义post请求的接口
 @app.post("/chat", tags=["聊天接口"], summary="POST方式聊天（需登录）")
 def chat_post(
     req: ChatRequest,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user) 
+    current_user = Depends(get_current_user)
 ):
     user_id = current_user.id
-    # 如果内存上下文为空，从数据库加载最近记录重建上下文
-    if user_id not in user_chat_history or not user_chat_history[user_id]:
-        records = get_latest_n_chat_history(db, user_id, 20)
-        user_chat_history[user_id] = [
-            {"role": r.role, "content": r.content}
-            for r in records
-        ]
-    user_history = get_user_history(user_id)
+    conv = _resolve_conversation(db, current_user, req.conversation_id,
+                                 first_message=req.message)
+    user_history = _ensure_context_loaded(db, user_id, conv.id)
     if req.clear_history:
-        clear_user_history(user_id)
-        return {
-            "code": 200,
-            "message": "success",
-            "data": {"message": "上下文已清空"}
-        }
+        user_chat_history.clear(user_id, conv.id)
+        return {"code": 200, "message": "success", "data": {"message": "上下文已清空"}}
     answer = call_ai(req.message, user_history)
-    save_and_record(db, user_id=user_id, role="user", content=req.message)
-    save_and_record(db, user_id=user_id, role="assistant", content=answer)
-    user_history.append({"role": "user", "content": req.message})
-    user_history.append({"role": "assistant", "content": answer})
-    if len(user_history) > 20:
-        user_chat_history[user_id] = user_history[-20:]
+    save_and_record(db, user_id, "user", req.message, conversation_id=conv.id)
+    save_and_record(db, user_id, "assistant", answer, conversation_id=conv.id)
+    user_chat_history.append_message(user_id, conv.id, "user", req.message)
+    user_chat_history.append_message(user_id, conv.id, "assistant", answer)
+    touch_conversation(db, conv.id)
     return {
         "code": 200,
         "message": "success",
-        "data": {"user": req.message, "ai": answer}
+        "data": {
+            "user": req.message, "ai": answer,
+            "conversation_id": conv.id, "conversation_title": conv.title,
+        }
     }
 
 
@@ -232,11 +278,22 @@ def chat_stream(
 ):
     user_id = current_user.id
 
-    # clear_history 直接清空上下文（不影响 DB 历史，前端可单独调 DELETE /history）
+    # 解析会话（无 ID 则新建一个，标题用首条消息）
+    conv = _resolve_conversation(db, current_user, req.conversation_id,
+                                 first_message=req.message)
+
+    # 第一个 chunk 先告诉前端"这条消息属于哪个会话"，
+    # 让前端可以立刻把会话切到新会话
+    init_payload = json.dumps(
+        {"type": "init", "conversation_id": conv.id, "conversation_title": conv.title},
+        ensure_ascii=False,
+    )
+
+    # clear_history 直接清空该会话的上下文
     if req.clear_history:
-        user_chat_history.clear(user_id)
-        # 用 SSE 返回一个事件告诉前端"已清空"
+        user_chat_history.clear(user_id, conv.id)
         def cleared():
+            yield f"data: {init_payload}\n\n"
             payload = json.dumps({"type": "info", "message": "上下文已清空"}, ensure_ascii=False)
             yield f"data: {payload}\n\n"
             yield "data: [DONE]\n\n"
@@ -246,23 +303,16 @@ def chat_stream(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # 重建上下文（从 DB 拿最近 20 条）
-    if not user_chat_history.get(user_id):
-        records = get_latest_n_chat_history(db, user_id, 20)
-        history = [{"role": r.role, "content": r.content} for r in records]
-        # 复用 cache 的 _store 以便后续 append_message 也能写进去
-        user_chat_history._store[user_id] = history
+    # 重建上下文
+    user_history = _ensure_context_loaded(db, user_id, conv.id)
+    history_snapshot = list(user_history)  # 给 stream_ai 用，避免双写
 
-    # 先把"未追加 user 消息"的历史快照存下来，传给 stream_ai
-    # （stream_ai 内部会自己拼 user 消息，避免双写）
-    history_snapshot = list(user_chat_history.get(user_id))
+    # 先把用户消息存 DB + 上下文（即使后面 stream 中途断开也不丢）
+    save_and_record(db, user_id=user_id, role="user", content=req.message, conversation_id=conv.id)
+    user_chat_history.append_message(user_id, conv.id, "user", req.message)
 
-    # 先把用户消息存 DB + 上下文（即使后面 stream 中途断开，用户消息也不丢）
-    save_and_record(db, user_id=user_id, role="user", content=req.message)
-    user_chat_history.append_message(user_id, "user", req.message)
-
-    # 把流式生成器 + 落库逻辑绑在一起
     def event_generator():
+        yield f"data: {init_payload}\n\n"
         full_content_parts = []
         try:
             for chunk in stream_ai(req.message, history_snapshot):
@@ -280,8 +330,10 @@ def chat_stream(
 
         full_content = "".join(full_content_parts)
         if full_content:
-            save_and_record(db, user_id=user_id, role="assistant", content=full_content)
-            user_chat_history.append_message(user_id, "assistant", full_content)
+            save_and_record(db, user_id=user_id, role="assistant",
+                            content=full_content, conversation_id=conv.id)
+            user_chat_history.append_message(user_id, conv.id, "assistant", full_content)
+            touch_conversation(db, conv.id)
 
         done_payload = json.dumps({"type": "done"}, ensure_ascii=False)
         yield f"data: {done_payload}\n\n"
@@ -291,7 +343,7 @@ def chat_stream(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # 关掉 nginx 之类的缓冲，保证实时
+            "X-Accel-Buffering": "no",  # 关掉 nginx 之类的中间缓冲，保证实时
         },
     )
 
@@ -301,13 +353,19 @@ def chat_stream(
 def get_my_history(
     skip: int = 0,
     limit: int = 100,
+    conversation_id: int | None = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    records = get_chat_history(db, current_user.id, skip, limit)
+    # 校验 conversation_id 属于当前用户
+    if conversation_id is not None and not get_conversation(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="会话不存在或不属于当前用户")
+
+    records = get_chat_history(db, current_user.id, skip, limit, conversation_id=conversation_id)
     history = [
         {
             "id": record.id,
+            "conversation_id": record.conversation_id,
             "role": record.role,
             "content": record.content,
             "create_time": record.create_time.strftime("%Y-%m-%d %H:%M:%S")
@@ -319,6 +377,7 @@ def get_my_history(
         "message": "success",
         "data": {
             "user_id": current_user.id,
+            "conversation_id": conversation_id,
             "total": len(history),
             "history": history
         }
@@ -327,19 +386,114 @@ def get_my_history(
 #添加删除聊天记录接口
 @app.delete("/history", tags=["聊天记录接口"], summary="清空我的聊天记录（需登录）")
 def delete_my_history(
+    conversation_id: int | None = None,
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    deleted_count = delete_chat_history(db, current_user.id)
-    clear_user_history(current_user.id)
+    if conversation_id is not None and not get_conversation(db, conversation_id, current_user.id):
+        raise HTTPException(status_code=404, detail="会话不存在或不属于当前用户")
+    deleted_count = delete_chat_history(db, current_user.id, conversation_id=conversation_id)
+    if conversation_id is not None:
+        user_chat_history.evict_conversation(current_user.id, conversation_id)
     return {
         "code": 200,
         "message": "success",
         "data": {
             "user_id": current_user.id,
+            "conversation_id": conversation_id,
             "deleted_count": deleted_count,
-            "message": "已清空你的聊天记录"
+            "message": "已清空聊天记录"
         }
+    }
+
+
+# ===== 会话（Conversation）CRUD =====
+
+@app.get("/conversations", tags=["会话接口"], summary="列出我的会话")
+def list_my_conversations(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    items = list_conversations(db, current_user.id, limit=limit)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": {
+            "user_id": current_user.id,
+            "total": len(items),
+            "conversations": [
+                {
+                    "id": c.id,
+                    "title": c.title,
+                    "created_at": c.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "updated_at": c.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                for c in items
+            ],
+        },
+    }
+
+
+@app.post("/conversations", tags=["会话接口"], summary="新建会话")
+def create_my_conversation(
+    req: ConversationCreate | None = None,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    title = (req.title if req and req.title else "新对话").strip()[:200] or "新对话"
+    conv = create_conversation(db, current_user.id, title)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": {
+            "id": conv.id,
+            "title": conv.title,
+            "created_at": conv.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
+
+
+@app.patch("/conversations/{conversation_id}", tags=["会话接口"], summary="重命名会话")
+def rename_my_conversation(
+    conversation_id: int,
+    req: ConversationRename,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    conv = rename_conversation(db, conversation_id, current_user.id, req.title)
+    if not conv:
+        raise HTTPException(status_code=404, detail="会话不存在或不属于当前用户")
+    return {
+        "code": 200,
+        "message": "success",
+        "data": {
+            "id": conv.id,
+            "title": conv.title,
+            "updated_at": conv.updated_at.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
+
+
+@app.delete("/conversations/{conversation_id}", tags=["会话接口"], summary="删除会话（级联删除消息）")
+def delete_my_conversation(
+    conversation_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    deleted = delete_conversation(db, conversation_id, current_user.id)
+    if not deleted and not get_conversation(db, conversation_id, current_user.id):
+        # 没找到也直接当不存在处理，避免泄露信息
+        pass
+    user_chat_history.evict_conversation(current_user.id, conversation_id)
+    return {
+        "code": 200,
+        "message": "success",
+        "data": {
+            "conversation_id": conversation_id,
+            "deleted_records": deleted,
+            "message": "会话已删除",
+        },
     }
 
 
